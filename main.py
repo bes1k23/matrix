@@ -1,16 +1,7 @@
 import json
 import logging
-import sqlite3
-import time
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Настройка логирования
 logging.basicConfig(
@@ -19,21 +10,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Подключение к базе данных SQLite
-conn = sqlite3.connect("user_data.db", check_same_thread=False)
-cursor = conn.cursor()
-
-# Создание таблицы для хранения результатов
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS user_results (
-    user_id TEXT PRIMARY KEY,
-    results TEXT,
-    recommendations TEXT
-)
-""")
-conn.commit()
-
-# Загрузка данных из JSON
+# Загрузка вопросов из JSON
 def load_questions(file_path: str):
     try:
         with open(file_path, "r", encoding="utf-8") as file:
@@ -51,7 +28,7 @@ user_data = {}
 
 # Функция для создания шкалы прогресса
 def create_progress_bar(current_index: int, total_questions: int) -> str:
-    progress = int((current_index / total_questions) * 5)  # 5 блоков для шкалы
+    progress = int((current_index / total_questions) * 5)
     completed_blocks = "🟩" * progress
     remaining_blocks = "⬜️" * (5 - progress)
     percentage = int((current_index / total_questions) * 100)
@@ -64,7 +41,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"User {user_id} started the bot in chat {chat_id}.")
 
     if user_id not in user_data:
-        user_data[user_id] = {"current_question_index": 0, "scores": {}}
+        user_data[user_id] = {"current_competency_index": 0, "scores": {}}
 
     keyboard = [[InlineKeyboardButton("Начать оценку", callback_data="start_assessment")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -79,19 +56,24 @@ async def start_assessment(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     logger.info(f"Assessment started for user {user_id}.")
 
     if user_id not in user_data:
-        user_data[user_id] = {"current_question_index": 0, "scores": {}}
+        user_data[user_id] = {"current_competency_index": 0, "scores": {}}
 
+    user_data[user_id]["current_competency_index"] = 0
+    user_data[user_id]["current_question_index"] = 0
     await ask_question(update, context, user_id)
 
 # Задать вопрос
 async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str) -> None:
-    current_index = user_data[user_id]["current_question_index"]
-    total_questions = len(QUESTIONS[0]["questions"])
-    if current_index >= total_questions:
-        await show_results(update, context, user_id)
+    current_competency_index = user_data[user_id]["current_competency_index"]
+    competency = QUESTIONS[current_competency_index]
+    questions = competency["questions"]
+    current_index = user_data[user_id].get("current_question_index", 0)
+
+    if current_index >= len(questions):
+        await finish_competency(update, context, user_id)
         return
 
-    question = QUESTIONS[0]["questions"][current_index]
+    question = questions[current_index]
 
     # Кнопки ответов
     keyboard = [
@@ -108,10 +90,10 @@ async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    progress_bar = create_progress_bar(current_index + 1, total_questions)
+    progress_bar = create_progress_bar(current_index + 1, len(questions))
     message = (
-        f"Компетенция: {QUESTIONS[0]['name']}\n"
-        f"Вопрос {current_index + 1} из {total_questions} 🔍\n"
+        f"Компетенция: {competency['name'].capitalize()}\n"
+        f"Вопрос {current_index + 1} из {len(questions)} 🔍\n"
         f"{progress_bar}\n\n"
         f"{question['question']}"
     )
@@ -124,42 +106,61 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     user_id = str(update.effective_user.id)
     answer_index = int(query.data.split("_")[1])
-    current_index = user_data[user_id]["current_question_index"]
+    current_competency_index = user_data[user_id]["current_competency_index"]
+    competency = QUESTIONS[current_competency_index]["name"]
 
-    # Сохранение ответа
-    competency = QUESTIONS[0]["name"]
-    if competency not in user_data[user_id]["scores"]:
-        user_data[user_id]["scores"][competency] = []
-    user_data[user_id]["scores"][competency].append(answer_index + 1)
+    # Инициализация scores как списка, если еще не инициализирован
+    scores = user_data[user_id]["scores"].setdefault(competency, [])
+
+    # Проверка типа данных
+    if isinstance(scores, float):
+        logger.error(f"Unexpected float value for scores: {scores}. Resetting to list.")
+        scores = []
+        user_data[user_id]["scores"][competency] = scores
+
+    # Добавление ответа
+    try:
+        scores.append(answer_index + 1)
+    except AttributeError as e:
+        logger.error(f"Error appending to scores: {e}")
+        scores = []  # Сброс на случай ошибки
+        scores.append(answer_index + 1)
 
     # Переход к следующему вопросу
     user_data[user_id]["current_question_index"] += 1
-    if user_data[user_id]["current_question_index"] < len(QUESTIONS[0]["questions"]):
+    await ask_question(update, context, user_id)
+
+# Завершение компетенции
+async def finish_competency(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str) -> None:
+    current_competency_index = user_data[user_id]["current_competency_index"]
+    competency = QUESTIONS[current_competency_index]["name"]
+
+    # Сохраняем результаты для текущей компетенции
+    scores = user_data[user_id]["scores"].get(competency, [])
+    average_score = sum(scores) / len(scores) if scores else 0
+    user_data[user_id]["scores"][competency] = average_score
+
+    # Переходим к следующей компетенции
+    current_competency_index += 1
+    if current_competency_index < len(QUESTIONS):
+        user_data[user_id]["current_competency_index"] = current_competency_index
+        user_data[user_id]["current_question_index"] = 0
         await ask_question(update, context, user_id)
     else:
-        await show_results(update, context, user_id)
+        # Все компетенции завершены
+        await show_final_results(update, context, user_id)
 
-# Показ результатов
-async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str) -> None:
+# Показ итоговых результатов
+async def show_final_results(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str) -> None:
     scores = user_data[user_id]["scores"]
-    teamwork_score = sum(scores["teamwork"]) / len(scores["teamwork"])
 
-    # Сохранение результатов в базу данных
-    cursor.execute("""
-    INSERT OR REPLACE INTO user_results (user_id, results, recommendations)
-    VALUES (?, ?, ?)
-    """, (user_id, json.dumps(scores), "TODO: Recommendations"))
-    conn.commit()
+    message = "📊 Итоговые результаты:\n"
+    for competency, score in scores.items():
+        message += f"• {competency.capitalize()}: {score:.2f}/5\n"
 
-    # Формирование сообщения с результатами
-    message = (
-        f"Результаты оценки:\n"
-        f"• Командная работа: {teamwork_score:.2f}/5\n\n"
-        f"Общий уровень: {teamwork_score:.2f}/5\n\n"
-        f"Рекомендации:\n"
-        f"• Пройдите курс 'Основы командной работы' (LO-AL3-001).\n"
-        f"• Изучите материал 'Как работать в команде эффективно' (LO-EL4-001)."
-    )
+    overall_score = sum(scores.values()) / len(scores) if scores else 0
+    message += f"\nОбщий уровень: {overall_score:.2f}/5\n"
+
     await update.callback_query.edit_message_text(message)
 
 # Основная функция
