@@ -90,7 +90,7 @@ async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
 
 # Основная функция
 def main() -> None:
-    application = Application.builder().token("YOUR_BOT_TOKEN").build()
+    application = Application.builder().token("7889453188:AAEmb2hKOv6dWxGrb7aWy59I2DSkMXwGhLY").build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(handle_callback))
