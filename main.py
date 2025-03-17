@@ -1,8 +1,7 @@
 import json
 import logging
+import sqlite3
 import time
-import traceback
-from datetime import datetime
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -12,25 +11,33 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from tracer_setup import setup_tracing  # Импортируем настройки OpenTelemetry
 
 # Настройка логирования
-setup_tracing()  # Инициализация OpenTelemetry
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
+# Подключение к базе данных SQLite
+conn = sqlite3.connect("user_data.db", check_same_thread=False)
+cursor = conn.cursor()
+
+# Создание таблицы для хранения результатов
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS user_results (
+    user_id TEXT PRIMARY KEY,
+    results TEXT,
+    recommendations TEXT
+)
+""")
+conn.commit()
+
 # Загрузка данных из JSON
 def load_questions(file_path: str):
-    start_time = time.time()
     try:
         with open(file_path, "r", encoding="utf-8") as file:
             questions = json.load(file)["competencies"]
-        duration = time.time() - start_time
-        logger.info(f"Questions loaded from {file_path} in {duration:.4f} seconds")
         return questions
     except FileNotFoundError:
         logger.error(f"File {file_path} not found.")
@@ -41,6 +48,14 @@ def load_questions(file_path: str):
 
 QUESTIONS = load_questions("questions.json")
 user_data = {}
+
+# Функция для создания шкалы прогресса
+def create_progress_bar(current_index: int, total_questions: int) -> str:
+    progress = int((current_index / total_questions) * 5)  # 5 блоков для шкалы
+    completed_blocks = "🟩" * progress
+    remaining_blocks = "⬜️" * (5 - progress)
+    percentage = int((current_index / total_questions) * 100)
+    return f"{completed_blocks}{remaining_blocks} ({percentage}% выполнено)"
 
 # Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -55,68 +70,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Готовы начать оценку компетенций?", reply_markup=reply_markup)
 
-# Команда /help
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = str(update.effective_user.id)
-    chat_id = update.effective_chat.id if update.effective_chat else "N/A"
-    logger.info(f"User {user_id} requested help in chat {chat_id}.")
-
-    help_text = (
-        "Доступные команды:\n"
-        "/start - Начать оценку компетенций\n"
-        "/repeat - Начать оценку заново\n"
-        "/help - Получить справку о боте\n"
-        "/cancel - Отменить текущее действие\n"
-        "/back - Вернуться к предыдущему вопросу\n"
-        "/finish - Завершить тест и показать результаты"
-    )
-    await update.message.reply_text(help_text)
-
-# Команда /repeat
-async def repeat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = str(update.effective_user.id)
-    chat_id = update.effective_chat.id if update.effective_chat else "N/A"
-    logger.info(f"User {user_id} requested to repeat the assessment in chat {chat_id}.")
-
-    user_data[user_id] = {"current_question_index": 0, "scores": {}}
-    await update.message.reply_text("Оценка начата заново.")
-    await start_assessment(update, context, user_id)
-
-# Обработка нажатий на кнопки
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        query = update.callback_query
-        await query.answer()
-
-        user_id = str(update.effective_user.id)
-        chat_id = update.effective_chat.id if update.effective_chat else "N/A"
-        data = query.data
-
-        logger.debug(f"Processing callback data: {data} for user {user_id} in chat {chat_id}")
-
-        if data == "start_assessment":
-            await start_assessment(update, context, user_id)
-        elif data.startswith("answer_"):
-            await handle_answer(update, context)
-        elif data == "back":
-            await go_back(update, context, user_id)
-        elif data == "finish":
-            await show_results(update, context, user_id)
-    except Exception as e:
-        error_message = f"Error handling callback: {e}\n{traceback.format_exc()}"
-        logger.error(error_message)
-        await update.callback_query.edit_message_text("Произошла ошибка. Пожалуйста, попробуйте снова.")
-
 # Начало оценки
-async def start_assessment(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str) -> None:
-    user_data[user_id]["current_question_index"] = 0
-    logger.info(f"Assessment started for user {user_id}. Current state: {user_data[user_id]}")
+async def start_assessment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    user_id = str(update.effective_user.id)
+    logger.info(f"Assessment started for user {user_id}.")
+
+    if user_id not in user_data:
+        user_data[user_id] = {"current_question_index": 0, "scores": {}}
+
     await ask_question(update, context, user_id)
 
 # Задать вопрос
 async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str) -> None:
     current_index = user_data[user_id]["current_question_index"]
-    if current_index >= len(QUESTIONS[0]["questions"]):
+    total_questions = len(QUESTIONS[0]["questions"])
+    if current_index >= total_questions:
         await show_results(update, context, user_id)
         return
 
@@ -137,11 +108,14 @@ async def ask_question(update: Update, context: ContextTypes.DEFAULT_TYPE, user_
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    progress = f"Вопрос {current_index + 1} из {len(QUESTIONS[0]['questions'])}"
-    logger.info(f"Sending question {current_index + 1} to user {user_id}. Current state: {user_data[user_id]}")
-    await update.callback_query.edit_message_text(
-        f"{progress}\n\n{question['question']}", reply_markup=reply_markup
+    progress_bar = create_progress_bar(current_index + 1, total_questions)
+    message = (
+        f"Компетенция: {QUESTIONS[0]['name']}\n"
+        f"Вопрос {current_index + 1} из {total_questions} 🔍\n"
+        f"{progress_bar}\n\n"
+        f"{question['question']}"
     )
+    await update.callback_query.edit_message_text(message, reply_markup=reply_markup)
 
 # Обработка ответов
 async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -149,7 +123,6 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await query.answer()
 
     user_id = str(update.effective_user.id)
-    chat_id = update.effective_chat.id if update.effective_chat else "N/A"
     answer_index = int(query.data.split("_")[1])
     current_index = user_data[user_id]["current_question_index"]
 
@@ -158,10 +131,6 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if competency not in user_data[user_id]["scores"]:
         user_data[user_id]["scores"][competency] = []
     user_data[user_id]["scores"][competency].append(answer_index + 1)
-    logger.info(
-        f"User {user_id} answered question {current_index + 1} with option {answer_index + 1}. "
-        f"Current state: {user_data[user_id]}"
-    )
 
     # Переход к следующему вопросу
     user_data[user_id]["current_question_index"] += 1
@@ -170,47 +139,40 @@ async def handle_answer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     else:
         await show_results(update, context, user_id)
 
-# Возврат к предыдущему вопросу
-async def go_back(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str) -> None:
-    user_data[user_id]["current_question_index"] -= 1
-    if user_data[user_id]["current_question_index"] < 0:
-        user_data[user_id]["current_question_index"] = 0  # Защита от выхода за пределы
-    logger.info(f"User {user_id} went back. Current state: {user_data[user_id]}")
-    await ask_question(update, context, user_id)
-
 # Показ результатов
 async def show_results(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: str) -> None:
     scores = user_data[user_id]["scores"]
     teamwork_score = sum(scores["teamwork"]) / len(scores["teamwork"])
-    logger.info(
-        f"Assessment completed for user {user_id}. Scores: {scores}. Final score: {teamwork_score:.2f}/5"
-    )
-    await update.callback_query.edit_message_text(
-        f"Ваша оценка:\n• Командная работа: {teamwork_score:.2f}/5"
-    )
 
-# Обработка неизвестных сообщений
-async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = str(update.effective_user.id)
-    chat_id = update.effective_chat.id if update.effective_chat else "N/A"
-    text = update.message.text
-    logger.warning(f"Unknown command or text received from user {user_id} in chat {chat_id}: {text}")
-    await update.message.reply_text("Я не понимаю эту команду. Пожалуйста, используйте кнопки или команды.")
+    # Сохранение результатов в базу данных
+    cursor.execute("""
+    INSERT OR REPLACE INTO user_results (user_id, results, recommendations)
+    VALUES (?, ?, ?)
+    """, (user_id, json.dumps(scores), "TODO: Recommendations"))
+    conn.commit()
+
+    # Формирование сообщения с результатами
+    message = (
+        f"Результаты оценки:\n"
+        f"• Командная работа: {teamwork_score:.2f}/5\n\n"
+        f"Общий уровень: {teamwork_score:.2f}/5\n\n"
+        f"Рекомендации:\n"
+        f"• Пройдите курс 'Основы командной работы' (LO-AL3-001).\n"
+        f"• Изучите материал 'Как работать в команде эффективно' (LO-EL4-001)."
+    )
+    await update.callback_query.edit_message_text(message)
 
 # Основная функция
 def main() -> None:
-    logger.info("Starting the bot...")
     application = Application.builder().token("7889453188:AAEmb2hKOv6dWxGrb7aWy59I2DSkMXwGhLY").build()
 
     # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("repeat", repeat_command))
-    application.add_handler(CallbackQueryHandler(handle_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_unknown))
+    application.add_handler(CallbackQueryHandler(start_assessment, pattern="^start_assessment$"))
+    application.add_handler(CallbackQueryHandler(handle_answer, pattern="^answer_"))
+    application.add_handler(CallbackQueryHandler(ask_question, pattern="^back$"))
 
     application.run_polling()
 
 if __name__ == "__main__":
-    logger.info("Initializing bot environment...")
     main()
